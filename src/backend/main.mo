@@ -1,9 +1,9 @@
 import Map "mo:core/Map";
 import Principal "mo:core/Principal";
 
-import AccessControl "authorization/access-control";
+import AccessControl "mo:caffeineai-authorization/access-control";
 import Runtime "mo:core/Runtime";
-import MixinAuthorization "authorization/MixinAuthorization";
+import MixinAuthorization "mo:caffeineai-authorization/MixinAuthorization";
 
 
 actor {

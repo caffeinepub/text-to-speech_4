@@ -2,6 +2,7 @@ import { fileURLToPath, URL } from "url";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 import environment from "vite-plugin-environment";
+import { viteStaticCopy } from "vite-plugin-static-copy";
 
 const ii_url =
   process.env.DFX_NETWORK === "local"
@@ -43,6 +44,14 @@ export default defineConfig({
     environment(["II_URL"]),
     environment(["STORAGE_GATEWAY_URL"]),
     react(),
+    viteStaticCopy({
+      targets: [
+        {
+          src: "node_modules/@mediapipe/hands/*",
+          dest: "mediapipe",
+        },
+      ],
+    }),
   ],
   resolve: {
     alias: [
@@ -55,6 +64,6 @@ export default defineConfig({
         replacement: fileURLToPath(new URL("./src", import.meta.url)),
       },
     ],
-    dedupe: ["@dfinity/agent"],
+    dedupe: ["@dfinity/agent"]
   },
 });

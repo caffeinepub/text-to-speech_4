@@ -4,11 +4,16 @@ import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
+import { useInternetIdentity } from "@caffeineai/core-infrastructure";
+import { Hands } from "@mediapipe/hands";
 import {
   Camera,
   Check,
   Copy,
+  Delete,
+  Download,
   Hand,
+  Layers,
   Loader2,
   LogIn,
   LogOut,
@@ -21,7 +26,6 @@ import {
 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useInternetIdentity } from "./hooks/useInternetIdentity";
 import { useSaveUserProfile, useUserProfile } from "./hooks/useQueries";
 
 const PLACEHOLDER = "Type or paste any text here\u2026";
@@ -90,55 +94,40 @@ function makeSignItems(text: string): SignItem[] {
 }
 
 type Landmark = { x: number; y: number; z: number };
-
 type ClassifyResult = { letter: string; confidence: number };
 
-/**
- * ISL classifier using MediaPipe hand landmarks.
- * Confidence is computed by scoring each letter's geometric rules.
- * Normalized by hand size for scale-invariant recognition.
- */
 function classifyISLLetter(lm: Landmark[]): ClassifyResult {
   if (!lm || lm.length < 21) return { letter: "?", confidence: 0 };
 
-  // Normalize distances by hand size (wrist to middle-MCP)
   const handSize = Math.hypot(lm[9].x - lm[0].x, lm[9].y - lm[0].y) || 0.15;
   const nd = (a: number, b: number) =>
     Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y) / handSize;
 
-  // Detect hand orientation: is pinky MCP to the right of index MCP?
   const isLeftHand = lm[17].x > lm[5].x;
-
-  // Thumb direction: "out" means away from palm
   const thumbSideOut = isLeftHand ? lm[4].x > lm[3].x : lm[4].x < lm[3].x;
   const thumbUp = lm[4].y < lm[2].y - 0.01;
 
-  // Finger extension: tip y < pip y = extended
   const idxExt = lm[8].y < lm[6].y;
   const midExt = lm[12].y < lm[10].y;
   const rngExt = lm[16].y < lm[14].y;
   const pkyExt = lm[20].y < lm[18].y;
 
-  // Fully extended: tip significantly above MCP
   const idxFull = lm[5].y - lm[8].y > handSize * 0.35;
   const midFull = lm[9].y - lm[12].y > handSize * 0.35;
   const rngFull = lm[13].y - lm[16].y > handSize * 0.35;
   const pkyFull = lm[17].y - lm[20].y > handSize * 0.35;
 
-  // Deeply curled: tip below its own MCP
   const idxDeep = lm[8].y > lm[5].y;
   const midDeep = lm[12].y > lm[9].y;
   const rngDeep = lm[16].y > lm[13].y;
 
-  // Normalized key distances
   const dThumbIdx = nd(4, 8);
   const dThumbMid = nd(4, 12);
   const dThumbRng = nd(4, 16);
   const dIdxMid = nd(8, 12);
   const dIdxRng = nd(8, 16);
-  void nd(12, 16); // dMidRng - computed but not used individually
+  void nd(12, 16);
 
-  // Index horizontal: moving sideways more than vertically
   const idxHoriz = Math.abs(lm[8].x - lm[5].x) > Math.abs(lm[8].y - lm[5].y);
   const midHoriz = Math.abs(lm[12].x - lm[9].x) > Math.abs(lm[12].y - lm[9].y);
 
@@ -354,7 +343,6 @@ function classifyISLLetter(lm: Landmark[]): ClassifyResult {
   return { letter: best, confidence };
 }
 
-// Frame buffer + threshold logic
 const FRAME_BUFFER_SIZE = 20;
 const CONSISTENCY_THRESHOLD = 0.7;
 const HOLD_MS = 600;
@@ -364,7 +352,7 @@ function SignToText() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const handsRef = useRef<any>(null);
+  const handsRef = useRef<InstanceType<typeof Hands> | null>(null);
   const animFrameRef = useRef<number | null>(null);
   const frameBufferRef = useRef<string[]>([]);
   const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -374,7 +362,6 @@ function SignToText() {
   const [running, setRunning] = useState(false);
   const [output, setOutput] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [mediapipeReady, setMediapipeReady] = useState(false);
   const [copied, setCopied] = useState(false);
   const [currentLetter, setCurrentLetter] = useState<string | null>(null);
   const [confidence, setConfidence] = useState(0);
@@ -385,26 +372,6 @@ function SignToText() {
   useEffect(() => {
     soundEnabledRef.current = soundEnabled;
   }, [soundEnabled]);
-  useEffect(() => {
-    const checkInterval = setInterval(() => {
-      if ((window as any).Hands) {
-        setMediapipeReady(true);
-        clearInterval(checkInterval);
-      }
-    }, 500);
-    const timeout = setTimeout(() => {
-      clearInterval(checkInterval);
-      if (!(window as any).Hands) {
-        setError(
-          "Hand detection unavailable. Please check your internet connection.",
-        );
-      }
-    }, 8000);
-    return () => {
-      clearInterval(checkInterval);
-      clearTimeout(timeout);
-    };
-  }, []);
 
   const stopCamera = useCallback(() => {
     if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
@@ -425,95 +392,98 @@ function SignToText() {
     setBufferConsistency(0);
   }, []);
 
-  const onHandResults = useCallback((results: any) => {
-    const canvas = canvasRef.current;
-    const video = videoRef.current;
-    if (!canvas || !video) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+  const onHandResults = useCallback(
+    (results: { multiHandLandmarks?: Landmark[][] }) => {
+      const canvas = canvasRef.current;
+      const video = videoRef.current;
+      if (!canvas || !video) return;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
 
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-      const landmarks: Landmark[] = results.multiHandLandmarks[0];
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const landmarks: Landmark[] = results.multiHandLandmarks[0];
 
-      ctx.fillStyle = "rgba(99,102,241,0.9)";
-      for (const lmk of landmarks) {
-        ctx.beginPath();
-        ctx.arc(lmk.x * canvas.width, lmk.y * canvas.height, 5, 0, 2 * Math.PI);
-        ctx.fill();
-      }
-
-      const result = classifyISLLetter(landmarks);
-      setCurrentLetter(result.letter);
-      setConfidence(result.confidence);
-
-      const buf = frameBufferRef.current;
-      buf.push(result.letter);
-      if (buf.length > FRAME_BUFFER_SIZE) buf.shift();
-
-      const count = buf.filter((l) => l === result.letter).length;
-      const consistency = buf.length > 0 ? count / buf.length : 0;
-      setBufferConsistency(consistency);
-
-      if (consistency >= CONSISTENCY_THRESHOLD && !cooldownRef.current) {
-        if (
-          !holdTimerRef.current ||
-          lastCapturedRef.current !== result.letter
-        ) {
-          lastCapturedRef.current = result.letter;
-          if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
-          holdTimerRef.current = setTimeout(() => {
-            holdTimerRef.current = null;
-            if (!cooldownRef.current) {
-              setOutput((prev) => prev + result.letter);
-              if (soundEnabledRef.current) {
-                const utt = new SpeechSynthesisUtterance(result.letter);
-                utt.rate = 1;
-                utt.pitch = 1;
-                utt.volume = 1;
-                window.speechSynthesis.cancel();
-                window.speechSynthesis.speak(utt);
-              }
-              cooldownRef.current = true;
-              lastCapturedRef.current = null;
-              frameBufferRef.current = [];
-              setTimeout(() => {
-                cooldownRef.current = false;
-              }, COOLDOWN_MS);
-            }
-          }, HOLD_MS);
+        ctx.fillStyle = "rgba(99,102,241,0.9)";
+        for (const lmk of landmarks) {
+          ctx.beginPath();
+          ctx.arc(
+            lmk.x * canvas.width,
+            lmk.y * canvas.height,
+            5,
+            0,
+            2 * Math.PI,
+          );
+          ctx.fill();
         }
-      } else if (consistency < CONSISTENCY_THRESHOLD) {
+
+        const result = classifyISLLetter(landmarks);
+        setCurrentLetter(result.letter);
+        setConfidence(result.confidence);
+
+        const buf = frameBufferRef.current;
+        buf.push(result.letter);
+        if (buf.length > FRAME_BUFFER_SIZE) buf.shift();
+
+        const count = buf.filter((l) => l === result.letter).length;
+        const consistency = buf.length > 0 ? count / buf.length : 0;
+        setBufferConsistency(consistency);
+
+        if (consistency >= CONSISTENCY_THRESHOLD && !cooldownRef.current) {
+          if (
+            !holdTimerRef.current ||
+            lastCapturedRef.current !== result.letter
+          ) {
+            lastCapturedRef.current = result.letter;
+            if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
+            holdTimerRef.current = setTimeout(() => {
+              holdTimerRef.current = null;
+              if (!cooldownRef.current) {
+                setOutput((prev) => prev + result.letter);
+                if (soundEnabledRef.current) {
+                  const utt = new SpeechSynthesisUtterance(result.letter);
+                  utt.rate = 1;
+                  utt.pitch = 1;
+                  utt.volume = 1;
+                  window.speechSynthesis.cancel();
+                  window.speechSynthesis.speak(utt);
+                }
+                cooldownRef.current = true;
+                lastCapturedRef.current = null;
+                frameBufferRef.current = [];
+                setTimeout(() => {
+                  cooldownRef.current = false;
+                }, COOLDOWN_MS);
+              }
+            }, HOLD_MS);
+          }
+        } else if (consistency < CONSISTENCY_THRESHOLD) {
+          if (holdTimerRef.current) {
+            clearTimeout(holdTimerRef.current);
+            holdTimerRef.current = null;
+            lastCapturedRef.current = null;
+          }
+        }
+      } else {
+        setCurrentLetter(null);
+        setConfidence(0);
+        setBufferConsistency(0);
+        frameBufferRef.current = [];
         if (holdTimerRef.current) {
           clearTimeout(holdTimerRef.current);
           holdTimerRef.current = null;
           lastCapturedRef.current = null;
         }
       }
-    } else {
-      setCurrentLetter(null);
-      setConfidence(0);
-      setBufferConsistency(0);
-      frameBufferRef.current = [];
-      if (holdTimerRef.current) {
-        clearTimeout(holdTimerRef.current);
-        holdTimerRef.current = null;
-        lastCapturedRef.current = null;
-      }
-    }
-  }, []);
+    },
+    [],
+  );
 
   const startCamera = useCallback(async () => {
     setError(null);
-    if (!(window as any).Hands) {
-      setError(
-        "Hand detection unavailable. Please check your internet connection.",
-      );
-      return;
-    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "user", width: 640, height: 480 },
@@ -524,9 +494,8 @@ function SignToText() {
         await videoRef.current.play();
       }
 
-      const hands = new (window as any).Hands({
-        locateFile: (file: string) =>
-          `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+      const hands = new Hands({
+        locateFile: (file: string) => `/mediapipe/${file}`,
       });
       hands.setOptions({
         maxNumHands: 1,
@@ -534,7 +503,7 @@ function SignToText() {
         minDetectionConfidence: 0.7,
         minTrackingConfidence: 0.5,
       });
-      hands.onResults(onHandResults);
+      hands.onResults(onHandResults as Parameters<typeof hands.onResults>[0]);
       handsRef.current = hands;
 
       const processFrame = async () => {
@@ -576,15 +545,13 @@ function SignToText() {
       : "bg-muted-foreground/30";
 
   return (
-    <div className="bg-card rounded-2xl shadow-md border border-border p-6 sm:p-8">
-      <h1 className="text-2xl font-extrabold tracking-tight mb-1">
-        <span className="bg-gradient-to-r from-primary to-violet-500 bg-clip-text text-transparent">
-          Sign Language
-        </span>{" "}
+    <div className="bg-card rounded-2xl shadow-elevated border border-border p-6 sm:p-8">
+      <h2 className="text-2xl font-extrabold tracking-tight mb-1">
+        <span className="text-gradient">Sign Language</span>{" "}
         <span className="text-foreground">to Text</span>
-      </h1>
+      </h2>
       <p className="text-xs text-muted-foreground mb-6">
-        Indian Sign Language (ISL) recognition with MediaPipe
+        Indian Sign Language (ISL) recognition · MediaPipe 21-point tracking
       </p>
 
       {error ? (
@@ -597,7 +564,6 @@ function SignToText() {
       ) : null}
 
       <div className="flex gap-4 flex-col sm:flex-row">
-        {/* Camera Feed */}
         <div className="flex-1">
           <div
             className="relative w-full rounded-xl overflow-hidden bg-black"
@@ -617,18 +583,13 @@ function SignToText() {
               <div className="absolute inset-0 flex items-center justify-center bg-black/60">
                 <div className="text-center text-white/70">
                   <Camera className="w-10 h-10 mx-auto mb-2 opacity-50" />
-                  <p className="text-sm">
-                    {mediapipeReady
-                      ? "Press Start to begin"
-                      : "Loading hand detection..."}
-                  </p>
+                  <p className="text-sm">Press Start to begin</p>
                 </div>
               </div>
             )}
           </div>
         </div>
 
-        {/* Live Detection Panel — Dramatic Letter Pop */}
         {running && (
           <div
             className={`flex flex-col items-center justify-center min-w-[160px] gap-3 p-5 rounded-xl border-2 transition-colors duration-500 relative overflow-hidden ${
@@ -639,18 +600,14 @@ function SignToText() {
                   : "border-border/40"
             } bg-black/40`}
           >
-            {/* Radial glow behind letter */}
             <div
-              className={`absolute inset-0 transition-opacity duration-500 ${
-                isReady ? "opacity-100" : "opacity-0"
-              }`}
+              className={`absolute inset-0 transition-opacity duration-500 ${isReady ? "opacity-100" : "opacity-0"}`}
               style={{
                 background:
                   "radial-gradient(ellipse at center, rgba(74,222,128,0.15) 0%, transparent 70%)",
               }}
             />
 
-            {/* Animated letter */}
             <AnimatePresence mode="wait">
               <motion.div
                 key={currentLetter ?? "none"}
@@ -669,12 +626,10 @@ function SignToText() {
               </motion.div>
             </AnimatePresence>
 
-            {/* Score */}
             <div className={`text-sm font-semibold z-10 ${confColor}`}>
               {currentLetter ? `${confidence}%` : "—"}
             </div>
 
-            {/* Bar */}
             <div className="w-full z-10">
               <div className="h-2 rounded-full bg-muted overflow-hidden">
                 <motion.div
@@ -702,7 +657,7 @@ function SignToText() {
           <Button
             data-ocid="s2t.primary_button"
             onClick={startCamera}
-            className="rounded-full px-6 gap-2 bg-primary text-primary-foreground hover:bg-primary/90 hover:-translate-y-0.5 transition-all"
+            className="rounded-full px-6 gap-2 bg-primary text-primary-foreground hover:bg-primary/90 hover:-translate-y-0.5 transition-smooth"
           >
             <Play className="w-4 h-4 fill-current" />
             Start
@@ -712,7 +667,7 @@ function SignToText() {
             data-ocid="s2t.secondary_button"
             onClick={stopCamera}
             variant="secondary"
-            className="rounded-full px-6 gap-2 hover:-translate-y-0.5 transition-all"
+            className="rounded-full px-6 gap-2 hover:-translate-y-0.5 transition-smooth"
           >
             <Square className="w-4 h-4 fill-current" />
             Stop
@@ -722,35 +677,36 @@ function SignToText() {
           data-ocid="s2t.delete_button"
           onClick={() => setOutput("")}
           variant="outline"
-          className="rounded-full px-5 gap-2 hover:-translate-y-0.5 transition-all"
+          className="rounded-full px-5 gap-2 hover:-translate-y-0.5 transition-smooth"
           disabled={!output}
         >
           <Trash2 className="w-4 h-4" />
           Clear
         </Button>
         <Button
-          data-ocid="s2t.secondary_button"
+          data-ocid="s2t.space_button"
           onClick={() => setOutput((prev) => `${prev} `)}
           variant="outline"
-          className="rounded-full px-5 hover:-translate-y-0.5 transition-all text-sm"
+          className="rounded-full px-5 hover:-translate-y-0.5 transition-smooth text-sm"
         >
           + Space
         </Button>
         <Button
-          data-ocid="s2t.delete_button"
-          onClick={() => setOutput((prev) => prev.slice(0, -1))}
+          data-ocid="s2t.remove_last_sign_button"
+          onClick={() => setOutput((prev) => prev.trimEnd().slice(0, -1))}
           variant="outline"
-          className="rounded-full px-4 hover:-translate-y-0.5 transition-all text-sm"
-          disabled={!output}
-          title="Backspace"
+          className="rounded-full px-5 gap-2 hover:-translate-y-0.5 transition-smooth text-sm border-amber-500/40 text-amber-400 hover:bg-amber-500/10 hover:text-amber-300 hover:border-amber-400/60"
+          disabled={!output.trim()}
+          title="Remove the last captured sign letter"
         >
-          ⌫
+          <Delete className="w-4 h-4" />
+          Remove Last
         </Button>
         <Button
-          data-ocid="s2t.secondary_button"
+          data-ocid="s2t.sound_toggle"
           onClick={() => setSoundEnabled((p) => !p)}
           variant={soundEnabled ? "secondary" : "outline"}
-          className="rounded-full px-4 hover:-translate-y-0.5 transition-all text-sm gap-1.5"
+          className="rounded-full px-4 hover:-translate-y-0.5 transition-smooth text-sm gap-1.5"
           title={
             soundEnabled
               ? "Sound On — click to mute"
@@ -775,12 +731,12 @@ function SignToText() {
             Recognized Text
           </label>
           <Button
-            data-ocid="s2t.secondary_button"
+            data-ocid="s2t.copy_button"
             onClick={handleCopy}
             variant="ghost"
             size="sm"
             disabled={!output}
-            className="h-7 px-3 gap-1.5 text-xs rounded-full hover:-translate-y-0.5 transition-all"
+            className="h-7 px-3 gap-1.5 text-xs rounded-full hover:-translate-y-0.5 transition-smooth"
           >
             {copied ? (
               <>
@@ -814,13 +770,93 @@ function SignToText() {
   );
 }
 
-// ─── Auth / Registration screens ────────────────────────────────────────────
+// ─── Architecture Tab ─────────────────────────────────────────────────────────
+
+function ArchitectureTab() {
+  const handleDownload = useCallback(() => {
+    const link = document.createElement("a");
+    link.href = "/assets/generated/architecture-diagram.dim_900x700.png";
+    link.download = "signbridge-ai-architecture.png";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }, []);
+
+  return (
+    <div className="bg-card rounded-2xl shadow-elevated border border-border p-6 sm:p-8">
+      <div className="flex items-start justify-between mb-5 gap-4">
+        <div>
+          <h2 className="text-2xl font-extrabold tracking-tight mb-1">
+            <span className="text-gradient">System</span>{" "}
+            <span className="text-foreground">Architecture</span>
+          </h2>
+          <p className="text-xs text-muted-foreground">
+            Full stack overview — React · Motoko · ICP · MediaPipe
+          </p>
+        </div>
+        <Button
+          data-ocid="arch.download_button"
+          onClick={handleDownload}
+          variant="outline"
+          className="rounded-full px-5 gap-2 hover:-translate-y-0.5 transition-smooth shrink-0 border-primary/40 text-primary hover:bg-primary/10"
+        >
+          <Download className="w-4 h-4" />
+          Download
+        </Button>
+      </div>
+
+      <div className="rounded-xl overflow-hidden border border-border/60 bg-black/20">
+        <img
+          src="/assets/generated/architecture-diagram.dim_900x700.png"
+          alt="SignBridge AI system architecture diagram"
+          className="w-full h-auto object-contain"
+          data-ocid="arch.diagram_image"
+        />
+      </div>
+
+      <div className="mt-6 grid grid-cols-1 sm:grid-cols-2 gap-3">
+        {[
+          {
+            label: "Frontend",
+            detail: "React + TypeScript + Tailwind CSS + Vite",
+          },
+          { label: "Backend", detail: "Motoko canister on Internet Computer" },
+          {
+            label: "Sign Recognition",
+            detail: "MediaPipe Hands (21-point landmarks)",
+          },
+          {
+            label: "Deployment",
+            detail: "ICP via Caffeine — decentralized, always-on",
+          },
+          { label: "Speech API", detail: "Browser-native Web Speech API" },
+          { label: "Auth", detail: "Internet Identity (ICP)" },
+        ].map(({ label, detail }) => (
+          <div
+            key={label}
+            className="flex gap-3 p-3 rounded-lg bg-muted/30 border border-border/40"
+          >
+            <div className="w-2 h-2 rounded-full bg-primary mt-1.5 shrink-0" />
+            <div>
+              <div className="text-xs font-semibold text-foreground">
+                {label}
+              </div>
+              <div className="text-xs text-muted-foreground">{detail}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Auth Screens ─────────────────────────────────────────────────────────────
 
 function LoginScreen() {
   const { login, isLoggingIn, isInitializing } = useInternetIdentity();
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-background via-background to-primary/5 flex flex-col items-center justify-center px-6">
+    <div className="min-h-screen bg-background flex flex-col items-center justify-center px-6">
       <motion.div
         initial={{ opacity: 0, y: 24 }}
         animate={{ opacity: 1, y: 0 }}
@@ -828,36 +864,34 @@ function LoginScreen() {
         className="w-full max-w-sm"
       >
         <div className="flex flex-col items-center mb-8">
-          <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-primary to-violet-600 flex items-center justify-center mb-4 shadow-lg">
-            <Hand className="w-8 h-8 text-white" />
+          <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-primary to-violet-600 flex items-center justify-center mb-4 shadow-elevated">
+            <Hand className="w-8 h-8 text-primary-foreground" />
           </div>
           <h1 className="text-3xl font-extrabold tracking-tight">
             <span className="text-foreground">SignBridge </span>
-            <span className="bg-gradient-to-r from-primary to-violet-500 bg-clip-text text-transparent">
-              AI
-            </span>
+            <span className="text-gradient">AI</span>
           </h1>
           <p className="text-sm text-muted-foreground mt-2 text-center">
             ISL recognition · Text to Speech · Fingerspelling
           </p>
         </div>
 
-        <div className="bg-card border border-border rounded-2xl p-8 shadow-lg">
-          <h2 className="text-lg font-bold text-foreground mb-6">
-            Welcome back
-          </h2>
+        <div className="bg-card border border-border rounded-2xl p-8 shadow-elevated">
+          <p className="text-sm text-muted-foreground mb-6 text-center">
+            Sign in with Internet Identity to continue
+          </p>
           <Button
             data-ocid="auth.primary_button"
             onClick={login}
             disabled={isLoggingIn || isInitializing}
-            className="w-full rounded-xl gap-2 bg-primary text-primary-foreground hover:bg-primary/90 hover:-translate-y-0.5 transition-all py-5 text-base font-semibold"
+            className="w-full rounded-xl gap-2 bg-primary text-primary-foreground hover:bg-primary/90 hover:-translate-y-0.5 transition-smooth py-5 text-base font-semibold"
           >
             {isLoggingIn ? (
               <Loader2 className="w-4 h-4 animate-spin" />
             ) : (
               <LogIn className="w-4 h-4" />
             )}
-            {isLoggingIn ? "Signing in..." : "Sign in"}
+            {isLoggingIn ? "Signing in..." : "Sign in with Internet Identity"}
           </Button>
         </div>
       </motion.div>
@@ -883,7 +917,7 @@ function RegisterScreen({ onDone }: { onDone: () => void }) {
   );
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-background via-background to-primary/5 flex flex-col items-center justify-center px-6">
+    <div className="min-h-screen bg-background flex flex-col items-center justify-center px-6">
       <motion.div
         initial={{ opacity: 0, y: 24 }}
         animate={{ opacity: 1, y: 0 }}
@@ -891,8 +925,8 @@ function RegisterScreen({ onDone }: { onDone: () => void }) {
         className="w-full max-w-sm"
       >
         <div className="flex flex-col items-center mb-8">
-          <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-primary to-violet-600 flex items-center justify-center mb-4 shadow-lg">
-            <UserPlus className="w-8 h-8 text-white" />
+          <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-primary to-violet-600 flex items-center justify-center mb-4 shadow-elevated">
+            <UserPlus className="w-8 h-8 text-primary-foreground" />
           </div>
           <h1 className="text-2xl font-extrabold text-foreground tracking-tight">
             Create your profile
@@ -902,7 +936,7 @@ function RegisterScreen({ onDone }: { onDone: () => void }) {
           </p>
         </div>
 
-        <div className="bg-card border border-border rounded-2xl p-8 shadow-lg">
+        <div className="bg-card border border-border rounded-2xl p-8 shadow-elevated">
           <form onSubmit={handleSubmit} className="space-y-5">
             <div className="space-y-2">
               <Label htmlFor="reg-username" className="text-sm font-semibold">
@@ -947,7 +981,7 @@ function RegisterScreen({ onDone }: { onDone: () => void }) {
               data-ocid="register.submit_button"
               type="submit"
               disabled={isPending || !username.trim() || !email.trim()}
-              className="w-full rounded-xl gap-2 bg-primary text-primary-foreground hover:bg-primary/90 hover:-translate-y-0.5 transition-all py-5 text-base font-semibold"
+              className="w-full rounded-xl gap-2 bg-primary text-primary-foreground hover:bg-primary/90 hover:-translate-y-0.5 transition-smooth py-5 text-base font-semibold"
             >
               {isPending ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
@@ -963,7 +997,7 @@ function RegisterScreen({ onDone }: { onDone: () => void }) {
   );
 }
 
-// ─── Main App ────────────────────────────────────────────────────────────────
+// ─── Main App ─────────────────────────────────────────────────────────────────
 
 function MainApp() {
   const { clear, identity } = useInternetIdentity();
@@ -1023,17 +1057,14 @@ function MainApp() {
   return (
     <div className="min-h-screen bg-background flex flex-col">
       {/* Header */}
-      <header className="w-full border-b border-border bg-gradient-to-r from-card via-card to-primary/5">
+      <header className="w-full border-b border-border bg-card">
         <div className="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-primary to-violet-600 flex items-center justify-center">
-              <Hand className="w-4 h-4 text-white" />
+              <Hand className="w-4 h-4 text-primary-foreground" />
             </div>
-            <span className="text-lg font-bold text-foreground tracking-tight">
-              SignBridge{" "}
-              <span className="bg-gradient-to-r from-primary to-violet-500 bg-clip-text text-transparent">
-                AI
-              </span>
+            <span className="text-lg font-bold tracking-tight">
+              SignBridge <span className="text-gradient">AI</span>
             </span>
           </div>
           <div className="flex items-center gap-3">
@@ -1047,7 +1078,7 @@ function MainApp() {
               onClick={clear}
               variant="ghost"
               size="sm"
-              className="gap-2 text-xs rounded-full px-3 hover:bg-destructive/10 hover:text-destructive transition-colors"
+              className="gap-2 text-xs rounded-full px-3 hover:bg-destructive/10 hover:text-destructive transition-smooth"
             >
               <LogOut className="w-3.5 h-3.5" />
               Logout
@@ -1056,12 +1087,12 @@ function MainApp() {
         </div>
       </header>
 
-      <main className="flex-1 flex items-start justify-center px-6 py-12">
+      <main className="flex-1 flex items-start justify-center px-6 py-10">
         <motion.div
-          initial={{ opacity: 0, y: 24 }}
+          initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5 }}
-          className="w-full max-w-[740px]"
+          transition={{ duration: 0.45 }}
+          className="w-full max-w-[760px]"
         >
           <Tabs
             value={activeTab}
@@ -1075,7 +1106,7 @@ function MainApp() {
               <TabsTrigger
                 value="voice"
                 data-ocid="tools.voice.tab"
-                className="rounded-full gap-2 flex-1 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm transition-all"
+                className="rounded-full gap-2 flex-1 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm transition-smooth"
               >
                 <Volume2 className="w-4 h-4" />
                 Text to Voice
@@ -1083,7 +1114,7 @@ function MainApp() {
               <TabsTrigger
                 value="sign"
                 data-ocid="tools.sign.tab"
-                className="rounded-full gap-2 flex-1 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm transition-all"
+                className="rounded-full gap-2 flex-1 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm transition-smooth"
               >
                 <Hand className="w-4 h-4" />
                 Sign Language
@@ -1091,22 +1122,28 @@ function MainApp() {
               <TabsTrigger
                 value="sign2text"
                 data-ocid="tools.sign2text.tab"
-                className="rounded-full gap-2 flex-1 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm transition-all"
+                className="rounded-full gap-2 flex-1 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm transition-smooth"
               >
                 <Camera className="w-4 h-4" />
                 Sign to Text
+              </TabsTrigger>
+              <TabsTrigger
+                value="architecture"
+                data-ocid="tools.architecture.tab"
+                className="rounded-full gap-2 flex-1 data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm transition-smooth"
+              >
+                <Layers className="w-4 h-4" />
+                Architecture
               </TabsTrigger>
             </TabsList>
 
             {/* Text to Voice Tab */}
             <TabsContent value="voice">
-              <div className="bg-gradient-to-b from-card to-card/80 rounded-2xl shadow-md border border-border p-6 sm:p-10">
-                <h1 className="text-2xl font-extrabold tracking-tight mb-5">
-                  <span className="bg-gradient-to-r from-primary to-violet-500 bg-clip-text text-transparent">
-                    Turn Text
-                  </span>{" "}
+              <div className="bg-card rounded-2xl shadow-elevated border border-border p-6 sm:p-10">
+                <h2 className="text-2xl font-extrabold tracking-tight mb-5">
+                  <span className="text-gradient">Turn Text</span>{" "}
                   <span className="text-foreground">into Voice</span>
-                </h1>
+                </h2>
                 <label
                   htmlFor="tts-input"
                   className="block text-sm font-semibold text-foreground mb-2"
@@ -1175,7 +1212,7 @@ function MainApp() {
                     data-ocid="tts.primary_button"
                     onClick={handleSpeak}
                     disabled={speaking || !text.trim()}
-                    className="rounded-full px-7 py-5 gap-2 bg-primary text-primary-foreground hover:bg-primary/90 hover:-translate-y-0.5 transition-all font-semibold"
+                    className="rounded-full px-7 py-5 gap-2 bg-primary text-primary-foreground hover:bg-primary/90 hover:-translate-y-0.5 transition-smooth font-semibold"
                   >
                     <Play className="w-4 h-4 fill-current" />
                     Speak
@@ -1185,7 +1222,7 @@ function MainApp() {
                     onClick={handleStop}
                     disabled={!speaking}
                     variant="secondary"
-                    className="rounded-full px-7 py-5 gap-2 hover:-translate-y-0.5 transition-all"
+                    className="rounded-full px-7 py-5 gap-2 hover:-translate-y-0.5 transition-smooth"
                   >
                     <Square className="w-4 h-4 fill-current" />
                     Stop
@@ -1196,13 +1233,11 @@ function MainApp() {
 
             {/* Sign Language Tab */}
             <TabsContent value="sign">
-              <div className="bg-gradient-to-b from-card to-card/80 rounded-2xl shadow-md border border-border p-6 sm:p-10">
-                <h1 className="text-2xl font-extrabold tracking-tight mb-5">
-                  <span className="bg-gradient-to-r from-primary to-violet-500 bg-clip-text text-transparent">
-                    Turn Text
-                  </span>{" "}
+              <div className="bg-card rounded-2xl shadow-elevated border border-border p-6 sm:p-10">
+                <h2 className="text-2xl font-extrabold tracking-tight mb-5">
+                  <span className="text-gradient">Turn Text</span>{" "}
                   <span className="text-foreground">into Sign Language</span>
-                </h1>
+                </h2>
                 <label
                   htmlFor="sign-input"
                   className="block text-sm font-semibold text-foreground mb-2"
@@ -1227,7 +1262,7 @@ function MainApp() {
                     data-ocid="sign.primary_button"
                     onClick={handleConvert}
                     disabled={!text.trim()}
-                    className="rounded-full px-7 py-5 gap-2 bg-primary text-primary-foreground hover:bg-primary/90 hover:-translate-y-0.5 transition-all font-semibold"
+                    className="rounded-full px-7 py-5 gap-2 bg-primary text-primary-foreground hover:bg-primary/90 hover:-translate-y-0.5 transition-smooth font-semibold"
                   >
                     <Hand className="w-4 h-4" />
                     Convert to Signs
@@ -1271,6 +1306,11 @@ function MainApp() {
             {/* Sign to Text Tab */}
             <TabsContent value="sign2text">
               <SignToText />
+            </TabsContent>
+
+            {/* Architecture Tab */}
+            <TabsContent value="architecture">
+              <ArchitectureTab />
             </TabsContent>
           </Tabs>
         </motion.div>
